@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION="${region}"
+QUEUE_URL="${queue_url}"
+BUCKET="${bucket_name}"
+SFTP_SECRET_ARN="${sftp_secret_arn}"
+KNOWN_HOSTS_ENTRY='${known_hosts_entry}'
+REMOTE_DIR_IMAGE="${remote_dir_image}"
+IMAGE_PREFIX="${image_prefix}"
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y python3 python3-pip jq awscli openssh-client
+
+pip3 install --no-cache-dir boto3 paramiko pyarrow pandas
+
+# App dir
+mkdir -p /opt/image-worker
+cat >/opt/image-worker/worker.py <<'PY'
+import os, json, time, base64, datetime
+import boto3
+import botocore
+import paramiko
+from urllib.parse import unquote_plus
+
+REGION = os.environ["REGION"]
+QUEUE_URL = os.environ["QUEUE_URL"]
+BUCKET = os.environ["BUCKET"]
+SFTP_SECRET_ARN = os.environ["SFTP_SECRET_ARN"]
+KNOWN_HOSTS_ENTRY = os.environ["KNOWN_HOSTS_ENTRY"]
+REMOTE_DIR_IMAGE = os.environ["REMOTE_DIR_IMAGE"]
+IMAGE_PREFIX = os.environ["IMAGE_PREFIX"]
+
+sqs = boto3.client("sqs", region_name=REGION)
+s3  = boto3.client("s3", region_name=REGION)
+secrets = boto3.client("secretsmanager", region_name=REGION)
+
+def load_secret():
+    resp = secrets.get_secret_value(SecretId=SFTP_SECRET_ARN)
+    return json.loads(resp["SecretString"])
+
+def ensure_known_hosts():
+    os.makedirs("/root/.ssh", exist_ok=True)
+    path = "/root/.ssh/known_hosts"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(KNOWN_HOSTS_ENTRY.strip() + "\n")
+    os.chmod("/root/.ssh", 0o700)
+    os.chmod(path, 0o600)
+    return path
+
+def write_private_key(key_pem: str) -> str:
+    path = "/root/.ssh/sftp_key"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(key_pem)
+    os.chmod(path, 0o600)
+    return path
+
+def parse_s3_event_from_sqs(body: str):
+    msg = json.loads(body)
+    # S3 -> SQS payload typically has "Records"
+    rec = msg["Records"][0]
+    bucket = rec["s3"]["bucket"]["name"]
+    key = unquote_plus(rec["s3"]["object"]["key"])
+    return bucket, key
+
+def sftp_connect(host, port, username, key_path):
+    ensure_known_hosts()
+    pkey = paramiko.RSAKey.from_private_key_file(key_path)
+    ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    ssh.connect(hostname=host, port=int(port), username=username, pkey=pkey, timeout=30, banner_timeout=30, auth_timeout=30)
+    return ssh, ssh.open_sftp()
+
+def remote_exists(sftp, remote_path: str) -> bool:
+    try:
+        sftp.stat(remote_path)
+        return True
+    except FileNotFoundError:
+        return False
+
+def main_loop():
+    secret = load_secret()
+    host = secret.get("sftp_host")
+    port = secret.get("sftp_port")
+    username = secret.get("sftp_username")
+    key_pem = secret.get("sftp_private_key_pem")
+
+    key_path = write_private_key(key_pem)
+
+    while True:
+        resp = sqs.receive_message(
+            QueueUrl=QUEUE_URL,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=20
+        )
+        msgs = resp.get("Messages", [])
+        if not msgs:
+            continue
+
+        m = msgs[0]
+        receipt = m["ReceiptHandle"]
+        try:
+            bucket, key = parse_s3_event_from_sqs(m["Body"])
+
+            # Only handle image prefix (defensive)
+            if not key.startswith(IMAGE_PREFIX):
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
+                continue
+
+            base = os.path.basename(key)
+            stem = os.path.splitext(base)[0]
+            ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            out_name = f"{stem}_{ts}.parquet"
+            local_in = f"/tmp/{base}"
+            local_out = f"/tmp/{out_name}"
+
+            s3.download_file(bucket, key, local_in)
+
+            # Placeholder processing: write a minimal parquet with metadata about input
+            import pandas as pd
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            df = pd.DataFrame([{"source_bucket": bucket, "source_key": key, "processed_utc": ts}])
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, local_out)
+
+            ssh, sftp = sftp_connect(host, port, username, key_path)
+            remote_path = REMOTE_DIR_IMAGE.rstrip("/") + "/" + out_name
+
+            if remote_exists(sftp, remote_path):
+                # Policy F=2: skip if exists (treat as success)
+                sftp.close(); ssh.close()
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
+                continue
+
+            sftp.put(local_out, remote_path)
+            sftp.close(); ssh.close()
+
+            sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
+
+        except Exception as e:
+            # let it retry by not deleting message
+            print("ERROR:", repr(e))
+            time.sleep(2)
+
+if __name__ == "__main__":
+    main_loop()
+PY
+
+cat >/etc/systemd/system/image-worker.service <<EOF
+[Unit]
+Description=Image SQS worker -> SFTP uploader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=REGION=${REGION}
+Environment=QUEUE_URL=${QUEUE_URL}
+Environment=BUCKET=${BUCKET}
+Environment=SFTP_SECRET_ARN=${SFTP_SECRET_ARN}
+Environment=KNOWN_HOSTS_ENTRY=${KNOWN_HOSTS_ENTRY}
+Environment=REMOTE_DIR_IMAGE=${REMOTE_DIR_IMAGE}
+Environment=IMAGE_PREFIX=${IMAGE_PREFIX}
+ExecStart=/usr/bin/python3 /opt/image-worker/worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable image-worker.service
+systemctl start image-worker.service
